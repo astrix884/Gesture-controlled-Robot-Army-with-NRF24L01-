@@ -1,0 +1,218 @@
+
+/*
+  ARDUINO ROBOT ARMY - TRANSMITTER
+
+  Hardware:
+  Arduino Nano
+  MPU6050 (flat mounted)
+  NRF24L01
+
+  Controls:
+  Tilt forward  = Forward
+  Tilt backward = Backward
+  Tilt left     = Left
+  Tilt right    = Right
+  Neutral       = Stop
+*/
+
+#include <Wire.h>
+#include <SPI.h>
+#include <mpu6050.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <math.h>
+
+#define MPU_ADDRESS 0x68
+
+RF24 radio(9, 10);
+const byte address[6] = "BOT01";
+
+// Radio packet - same structure on all robots
+struct ControlPacket {
+  char command;
+  byte speed;
+  uint16_t sequence;
+};
+
+ControlPacket data;
+
+// MPU6050 variables
+int16_t rawGX, rawGY, rawGZ;
+int16_t rawAX, rawAY, rawAZ;
+
+float gyroOffsetX, gyroOffsetY, gyroOffsetZ;
+float accelOffsetX, accelOffsetY;
+
+float dpsGX, dpsGY, dpsGZ;
+float gForceAX, gForceAY, gForceAZ;
+
+float aPitch, aRoll;
+float filteredPitch = 0;
+float filteredRoll = 0;
+
+const float alpha = 0.95;
+
+const float TILT_THRESHOLD = 25.0;
+
+unsigned long previousTime = 0;
+uint16_t sequence = 0;
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // Initialize MPU6050
+  Wire.begin();
+
+  wakeSensor(MPU_ADDRESS);
+
+  Serial.println("Calibrating MPU6050...");
+  Serial.println("Keep the controller flat and still!");
+
+  delay(1000);
+
+  calculateGyroOffset(
+    MPU_ADDRESS,
+    gyroOffsetX,
+    gyroOffsetY,
+    gyroOffsetZ
+  );
+
+  calculateAccelOffset(
+    MPU_ADDRESS,
+    accelOffsetX,
+    accelOffsetY
+  );
+
+  Serial.println("MPU6050 calibration complete!");
+
+  // Initialize NRF24L01
+  if (!radio.begin()) {
+    Serial.println("NRF24 not detected!");
+    while (1);
+  }
+
+  radio.setChannel(100);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setPALevel(RF24_PA_LOW);
+
+  // Broadcast without individual ACKs
+  radio.setAutoAck(false);
+  radio.disableDynamicPayloads();
+
+  radio.setPayloadSize(sizeof(ControlPacket));
+
+  radio.openWritingPipe(address);
+  radio.stopListening();
+
+  data.command = 'S';
+  data.speed = 0;
+  data.sequence = 0;
+
+  previousTime = micros();
+
+  Serial.println("ROBOT ARMY TRANSMITTER READY!");
+}
+
+void loop() {
+
+  unsigned long currentTime = micros();
+
+  float dt = (currentTime - previousTime) / 1000000.0;
+  previousTime = currentTime;
+
+  if (dt <= 0 || dt > 0.1) {
+    dt = 0.02;
+  }
+
+  // Read gyroscope
+  readGyroData(
+    MPU_ADDRESS,
+    rawGX,
+    rawGY,
+    rawGZ
+  );
+
+  rawGyroToDPS(
+    rawGX, rawGY, rawGZ,
+    dpsGX, dpsGY, dpsGZ
+  );
+
+  // Read accelerometer
+  readAccelData(
+    MPU_ADDRESS,
+    rawAX,
+    rawAY,
+    rawAZ
+  );
+
+  rawAccelToGForce(
+    rawAX, rawAY, rawAZ,
+    gForceAX, gForceAY, gForceAZ
+  );
+
+  // Calculate angles from accelerometer
+  calculateAnglesFromAccel(
+    gForceAX,
+    gForceAY,
+    gForceAZ,
+    aPitch,
+    aRoll
+  );
+
+  // Remove calibration offsets
+  aPitch -= accelOffsetX;
+  aRoll -= accelOffsetY;
+
+  // Complementary filter
+  complementaryFilter(
+    dpsGX,
+    aPitch,
+    alpha,
+    dt,
+    filteredPitch
+  );
+
+  complementaryFilter(
+    dpsGY,
+    aRoll,
+    alpha,
+    dt,
+    filteredRoll
+  );
+
+  // Determine movement command
+  data.command = 'S';
+  data.speed = 180;
+
+  if (filteredPitch > TILT_THRESHOLD) {
+    data.command = 'F';
+  }
+  else if (filteredPitch < -TILT_THRESHOLD) {
+    data.command = 'B';
+  }
+  else if (filteredRoll < -TILT_THRESHOLD) {
+    data.command = 'L';
+  }
+  else if (filteredRoll > TILT_THRESHOLD) {
+    data.command = 'R';
+  }
+
+  // Sequence number
+  data.sequence = ++sequence;
+
+  // Broadcast to all four robots
+  radio.write(&data, sizeof(data));
+
+  // Serial monitoring
+  Serial.print("Pitch: ");
+  Serial.print(filteredPitch);
+
+  Serial.print(" | Roll: ");
+  Serial.print(filteredRoll);
+
+  Serial.print(" | Command: ");
+  Serial.println(data.command);
+
+  delay(20);
+}
